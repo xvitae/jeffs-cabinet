@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jeff's Cabinet</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 18px; }
+    label { display:block; margin:8px 0 4px; }
+    input[type=number] { width:120px; }
+    .row { display:flex; gap:12px; align-items:center; margin-bottom:8px; }
+    #canvasWrap { border:1px solid #ddd; width:820px; height:420px; background:#f9f9f9; position:relative; }
+    canvas { display:block; }
+    #log { margin-top:12px; white-space:pre-wrap; background:#fff; border:1px solid #eee; padding:8px; height:110px; overflow:auto; }
+    button { padding:8px 12px; }
+    .small { font-size:0.9rem; color:#444 }
+  </style>
+</head>
+<body>
+  <h2>Cabinet fit — wardrobe insertion simulator</h2>
+  <p class="small">Enter wardrobe internal width and depth (inches) and the opening width. The simulator will perform a coarse numeric search (config-space BFS) to check whether a cabinet (rectangle) can be rotated and translated through the opening into the wardrobe. Results are approximate and depend on resolution settings below.</p>
+
+  <div class="row">
+    <div>
+      <label>Wardrobe inner width (W) — across (inches)</label>
+      <input id="W" type="number" step="0.25" value="44.75" />
+    </div>
+    <div>
+      <label>Wardrobe inner depth (D) — front-to-back (inches)</label>
+      <input id="D" type="number" step="0.25" value="22.75" />
+    </div>
+    <div>
+      <label>Opening width (s) — door/gap (inches)</label>
+      <input id="s" type="number" step="0.25" value="32" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Search resolution (inches)</label>
+      <input id="xyStep" type="number" step="0.125" value="0.5" />
+    </div>
+    <div>
+      <label>Angle step (degrees)</label>
+      <input id="thetaStep" type="number" step="1" value="5" />
+    </div>
+    <div>
+      <label>Max iterations (safety)</label>
+      <input id="maxIters" type="number" step="1" value="300000" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Cabinet width (across) — a (inches)</label>
+      <input id="cabA" type="number" step="0.25" value="30" />
+    </div>
+    <div>
+      <label>Cabinet depth (front-to-back) — b (inches)</label>
+      <input id="cabB" type="number" step="0.25" value="16" />
+    </div>
+    <div style="align-self:end; color:#666; font-size:0.9rem">Use "Check specific cabinet" to test these values.</div>
+  </div>
+
+  <div class="row">
+    <button id="checkFit">Check specific cabinet</button>
+    <div style="margin-left:12px;" id="status"></div>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+// Utility and geometry helpers
+function toRad(deg){ return deg*Math.PI/180; }
+function rotatePoint(px,py,ox,oy,theta){ // rotate point (px,py) around (ox,oy)
+  const c = Math.cos(theta), s = Math.sin(theta);
+  const dx = px-ox, dy = py-oy;
+  return [ox + dx*c - dy*s, oy + dx*s + dy*c];
+}
+
+function rectCorners(cx, cy, w, h, theta){ // center (cx,cy), width w (along y), depth h (along x) ??? we'll use w as width (y-axis), h as depth (x-axis)
+  // We'll define rectangle dims half-extents along local axes: halfDepth (x local) and halfWidth (y local)
+  const hd = h/2, hw = w/2;
+  const cornersLocal = [ [-hd, -hw], [-hd, hw], [hd, hw], [hd, -hw] ];
+  const cos = Math.cos(theta), sin = Math.sin(theta);
+  const out = cornersLocal.map(([lx,ly]) => {
+    // local x along depth (x axis), local y along width (y axis)
+    const gx = cx + lx*cos - ly*sin;
+    const gy = cy + lx*sin + ly*cos;
+    return [gx,gy];
+  });
+  return out;
+}
+
+function pointInPoly(x,y,poly){ // ray-casting
+  let inside = false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i][0], yi=poly[i][1];
+    const xj=poly[j][0], yj=poly[j][1];
+    const intersect = ((yi>y)!=(yj>y)) && (x < (xj-xi)*(y-yi)/(yj-yi)+xi);
+    if(intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function polyIntersectsRect(poly, rx, ry, rw, rh){ // axis-aligned rect
+  // Check if any poly point inside rect
+  for(const [px,py] of poly) if(px>=rx && px<=rx+rw && py>=ry && py<=ry+rh) return true;
+  // Check if any rect corner inside poly
+  const rectCorners = [ [rx,ry],[rx+rw,ry],[rx+rw,ry+rh],[rx,ry+rh] ];
+  for(const [cx,cy] of rectCorners) if(pointInPoly(cx,cy,poly)) return true;
+  return false;
+}
+
+// Build obstacles for the wardrobe: coordinate system in inches
+// x: depth (0..D inside), positive into wardrobe; outside is x<0. y: across width (0..W)
+function buildObstacles(W,D,s){
+  // opening centered horizontally
+  const yo = (W - s)/2;
+  const big = 2000;
+  const obs = [];
+  // front left wall piece (x from -thick to 0) for y < yo
+  const thick = 0.5;
+  if(yo>0){ obs.push({x:-thick, y:-big, w:thick, h:yo+big}); }
+  // front right wall piece (x from -thick to 0) for y>yo+s
+  if(yo+s < W){ obs.push({x:-thick, y:yo+s, w:thick, h:big}); }
+  // side walls inside: for x in [0,D], y<0
+  obs.push({x:0, y:-big, w:D+thick, h: -(-0) + 0}); // placeholder - we'll add proper rectangles below
+  // Instead of making negative height rect, construct left and right long rectangles
+  obs.push({x:0, y:-big, w:D+thick, h:big}); // y<0 area (but overlaps opening area; we'll filter collision logic by requiring collisions for x>=0)
+  obs.push({x:0, y:W, w:D+thick, h:big}); // y>W area
+  // back wall
+  obs.push({x:D, y:-big, w:thick, h:big*2});
+  // We'll rely on collision checks where obstacles inside x>=0 region are considered.
+  return {obs, yo};
+}
+
+function rectPolygonCentroid(poly){ let x=0,y=0,area=0; for(let i=0,j=poly.length-1;i<poly.length;j=i++){ const xi=poly[i][0], yi=poly[i][1]; const xj=poly[j][0], yj=poly[j][1]; const a = xi*yj - xj*yi; area += a; x += (xi+xj)*a; y += (yi+yj)*a;} area *= 0.5; if(Math.abs(area)<1e-6) return [poly[0][0],poly[0][1]]; return [x/(6*area), y/(6*area)]; }
+
+// Check if a given rectangle configuration (center cx,cy, angle theta, dims a (width), b (depth)) collides with obstacles (simple AABB polygons)
+function collides(cx,cy,theta,a,b,W,D,s){
+  const poly = rectCorners(cx,cy,a,b,theta);
+  // If poly has any point with x < -1000 or > D+1000 it's fine; we check obstacles as defined
+  // Quick reject: if any corner inside interior x>=0 area but y outside [0,W] -> collision
+  for(const [px,py] of poly){
+    if(px >= 0 && (py < 0 || py > W)) return true;
+    if(px > D) return true; // beyond back wall
+  }
+  // front wall (thin) at x in [-0.5,0] for y outside opening
+  const yo = (W - s)/2;
+  const thick = 0.5;
+  // if poly intersects left front rectangle (x in [-thick,0], y in (-big,yo)) or right front rectangle (x in [-thick,0], y in (yo+s,big))
+  if(polyIntersectsRect(poly, -thick, -1000, thick, yo+1000)) return true;
+  if(polyIntersectsRect(poly, -thick, yo+s, thick, 1000)) return true;
+  // side walls inside already covered by corner checks above
+  // back wall: x > D is invalid; already checked
+  return false;
+}
+
+// Check if rectangle is fully inside interior (fully within x in [0,D], y in [0,W])
+function fullyInside(cx,cy,theta,a,b,W,D){
+  const poly = rectCorners(cx,cy,a,b,theta);
+  for(const [px,py] of poly){ if(px < 0 || px > D || py < 0 || py > W) return false; }
+  return true;
+}
+
+// BFS in discretized configuration space to find path
+function findPath(a,b,W,D,s, xyStep=0.5, thetaStepDeg=5, maxIters=200000){
+  const thetaStep = toRad(thetaStepDeg);
+  const thetaCount = Math.floor(Math.PI/2 / thetaStep) + 1;
+  // X range from -a - 2*thick to D+something
+  const minX = -a - 2;
+  const maxX = D + 2;
+  const minY = -Math.max(10, W);
+  const maxY = W + Math.max(10, W);
+  const xi = (x)=> Math.round((x - minX)/xyStep);
+  const yi = (y)=> Math.round((y - minY)/xyStep);
+  const ti = (t)=> Math.round(t/thetaStep);
+  const xiToX = (ix) => minX + ix*xyStep;
+  const yiToY = (iy) => minY + iy*xyStep;
+  const tiToT = (it) => it*thetaStep;
+  const xCount = Math.round((maxX-minX)/xyStep)+1;
+  const yCount = Math.round((maxY-minY)/xyStep)+1;
+  const tCount = Math.round((Math.PI/2)/thetaStep)+1;
+  const visited = new Uint8Array(xCount * yCount * tCount);
+  const q = [];
+  // Initialize starting states: rectangle fully outside => all corners x < 0
+  for(let iy=0; iy<yCount; iy+=1){
+    for(let it=0; it<tCount; it+=1){
+      const x = minX; // far left
+      const y = yiToY(iy);
+      const theta = tiToT(it);
+      const poly = rectCorners(x,y,a,b,theta);
+      let allLeft = true;
+      for(const [px,py] of poly){ if(px >= 0) { allLeft = false; break; } }
+      if(!allLeft) continue; // not fully outside
+      // ensure not colliding with front-wall obstacles
+      if(collides(x,y,theta,a,b,W,D,s)) continue;
+      const idx = (xi(x) * yCount + iy) * tCount + it;
+      visited[idx] = 1;
+      q.push([xi(x), iy, it]);
+    }
+  }
+  const neighbors = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+  let iters = 0;
+  while(q.length && iters < maxIters){
+    const [ix,iy,it] = q.shift();
+    const x = xiToX(ix), y = yiToY(iy), theta = tiToT(it);
+    if(fullyInside(x,y,theta,a,b,W,D)){
+      return true; // found path
+    }
+    for(const [dx,dy,dt] of neighbors){
+      const nix = ix+dx, niy = iy+dy, nit = it+dt;
+      if(nix<0||nix>=xCount||niy<0||niy>=yCount||nit<0||nit>=tCount) continue;
+      const nidx = (nix * yCount + niy) * tCount + nit;
+      if(visited[nidx]) continue;
+      const nx = xiToX(nix), ny = yiToY(niy), ntheta = tiToT(nit);
+      if(collides(nx,ny,ntheta,a,b,W,D,s)) { visited[nidx]=1; continue; }
+      visited[nidx] = 1;
+      q.push([nix,niy,nit]);
+    }
+    iters++;
+  }
+  return false;
+}
+
+// computeMax removed: this page now focuses on checking a specific cabinet only.
+
+// Check a user-specified cabinet size (a = width across, b = depth front-to-back)
+async function checkFit(){
+  const W = parseFloat(document.getElementById('W').value);
+  const D = parseFloat(document.getElementById('D').value);
+  const s = parseFloat(document.getElementById('s').value);
+  const a = parseFloat(document.getElementById('cabA').value);
+  const b = parseFloat(document.getElementById('cabB').value);
+  const xyStep = parseFloat(document.getElementById('xyStep').value);
+  const thetaStep = parseFloat(document.getElementById('thetaStep').value);
+  const maxIters = parseInt(document.getElementById('maxIters').value,10);
+  const log = document.getElementById('log');
+  const status = document.getElementById('status');
+  status.textContent = 'checking...';
+  log.textContent = `Checking cabinet a=${a}\" (width) b=${b}\" (depth) ...`;
+  await new Promise(r=>setTimeout(r,10));
+  try{
+    const ok = findPath(a,b,W,D,s, xyStep, thetaStep, maxIters);
+    if(ok){
+      log.textContent = `YES: cabinet ${a}\" x ${b}\" can be maneuvered through the ${s}\" opening into the ${W}\" x ${D}\" wardrobe (approx).`;
+    } else {
+      log.textContent = `NO: cabinet ${a}\" x ${b}\" could NOT be inserted with the current resolution/settings.`;
+    }
+  }catch(e){
+    log.textContent = 'Error during check: ' + e;
+  }
+  status.textContent = '';
+}
+
+document.getElementById('checkFit').addEventListener('click', async ()=>{
+  await checkFit();
+});
+</script>
+</body>
+</html>
